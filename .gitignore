@@ -34,3 +34,9 @@ $RECYCLE.BIN/
 
 # Logs
 *.log
+
+# Generated test / detection images
+yolo_images/
+
+# Internal Team Spec
+BunaVision.md

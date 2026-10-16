@@ -139,13 +139,31 @@ class YOLODetectorService:
         return self.is_loaded
 
     def classify_category(self, class_name: str) -> str:
+        """
+        Maps a raw ONNX class name to its ECX defect category.
+
+        Normalisation: hyphens and spaces → underscores, lowercased.
+        Lookup: EXACT set membership — NOT substring matching.
+
+        Why exact match matters:
+          "hitam" (Primary) is a substring of "hitam_sebagian" (Secondary).
+          Using `any(p in clean ...)` would wrongly classify Partial Black
+          as a Primary Defect, inflating penalties and producing wrong grades.
+        """
         clean = class_name.lower().replace("-", "_").replace(" ", "_")
-        if any(p in clean for p in PRIMARY_DEFECT_CLASSES):
+
+        if clean in PRIMARY_DEFECT_CLASSES:
             return "Primary Defect"
-        elif any(s in clean for s in SECONDARY_DEFECT_CLASSES):
+        elif clean in SECONDARY_DEFECT_CLASSES:
             return "Secondary Defect"
-        elif "healthy" in clean or "sound" in clean or "bean" in clean:
+        elif "healthy" in clean or "sound" in clean:
             return "Healthy"
+
+        # Unknown class — default to Secondary (less severe assumption)
+        logger.warning(
+            f"classify_category: unknown class '{class_name}' (normalised: '{clean}') "
+            "— defaulting to 'Secondary Defect'. Add it to the defect sets if needed."
+        )
         return "Secondary Defect"
 
     def detect(self, image_bytes: bytes, confidence_threshold: float = 0.25) -> YOLODetectionResult:
@@ -189,9 +207,12 @@ class YOLODetectorService:
 
         if len(filtered_boxes) == 0:
             return YOLODetectionResult(
-                model_version="YOLOv8n-Coffee-ONNX",
+                model_version="YOLOv8n-Coffee-ONNX-v1",
                 total_beans=0,
-                healthy_beans=0,
+                # -1 = not determinable by YOLO.
+                # This model was trained only on defect classes (hitam, hitam-sebagian,
+                # kulit-kopi-kecil). It cannot count healthy beans. Gemini estimates this.
+                healthy_beans=-1,
                 defect_beans=0,
                 defect_counts={},
                 detected_beans=[],
@@ -256,9 +277,11 @@ class YOLODetectorService:
         img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         return YOLODetectionResult(
-            model_version="YOLOv8n-Coffee-ONNX",
+            model_version="YOLOv8n-Coffee-ONNX-v1",
             total_beans=len(detected_beans),
-            healthy_beans=0, # Detector is trained on specific defects
+            # -1 = not determinable by YOLO (defect-only model).
+            # Gemini estimates the true healthy bean count from the full image.
+            healthy_beans=-1,
             defect_beans=len(detected_beans),
             defect_counts=counts,
             detected_beans=detected_beans,
@@ -275,12 +298,13 @@ class YOLODetectorService:
         return YOLODetectionResult(
             model_version="Standby-Detector",
             total_beans=0,
-            healthy_beans=0,
+            healthy_beans=-1,  # -1 = not determinable; model not loaded
             defect_beans=0,
             defect_counts={},
             detected_beans=[],
             annotated_image_base64=None
         )
+
 
 # Global singleton
 yolo_service = YOLODetectorService()

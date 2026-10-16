@@ -1,0 +1,12 @@
+{
+  "num_classes": 3,
+  "names": {
+    "0": "hitam",
+    "1": "hitam-sebagian",
+    "2": "kulit-kopi-kecil"
+  },
+  "dataset_source": "Roboflow / lulus-vpibo / green-coffee-bean-defects v14",
+  "dataset_license": "",
+  "checkpoint": "yolov8n.pt",
+  "imgsz": 640
+}

@@ -30,7 +30,7 @@ BunaVision transforms a smartphone photo of green coffee beans spread on a clean
 
 ```mermaid
 flowchart TD
-    User["📱 User (Mobile / Web App)"] -->|Uploads Green Bean Photo| API["🚀 FastAPI Engine (/api/v1/assess)"]
+    User["📱 User (Mobile / Web App)"] -->|Uploads Green Bean Photo| API["🚀 FastAPI Engine (/api/v1/assessments)"]
 
     subgraph Hybrid AI Pipeline
         API --> YOLO["🎯 Ultralytics YOLOv8n (Object Detection)"]
@@ -106,7 +106,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | :--- | :--- | :--- |
 | `GET` | `/health` | Service health status, Gemini config, and YOLO model state |
 | `POST` | `/api/v1/detect` | YOLOv8 bounding box defect detection and Base64 annotated image |
-| `POST` | `/api/v1/assess` | Full hybrid assessment (YOLO boxes + Gemini cupping report + Amharic notes) |
+| `POST` | `/api/v1/assessments` | Full hybrid assessment (YOLO boxes + Gemini cupping report + Amharic notes) |
 | `POST` | `/api/v1/reload-model` | Hot-reloads `models/best.pt` dynamically without downtime |
 
 ---
@@ -125,12 +125,15 @@ D:\Coding\Hackathon\
 │       └── yolo_detector.py   # YOLOv8 bounding box detector & visual annotator
 ├── models/
 │   ├── README.md              # Model weights guide
-│   └── best.pt                # Fine-tuned YOLOv8n weights
-├── train_yolov8_coffee.ipynb  # GPU training notebook (Google Colab)
+│   ├── best.onnx              # Production ONNX model (90.5% mAP50)
+│   ├── best.pt                # Fine-tuned YOLOv8n weights
+│   └── classes.json           # Defect class mapping manifest
+├── notebooks/
+│   └── train_yolov8_coffee.ipynb  # GPU training pipeline (Google Colab)
+├── tests/                     # Automated test suite (13/13 passing)
 ├── API_INTEGRATION_GUIDE.md   # Integration handbook for frontend & backend devs
 ├── Dockerfile                 # Production deployment container
-├── test_client.py             # CLI test runner
-├── generate_test_image.py     # Synthetic test image generator
+├── pytest.ini                 # Test suite configuration
 ├── requirements.txt           # Pinned dependencies
 └── README.md                  # Project documentation
 ```
