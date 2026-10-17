@@ -22,7 +22,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.config import settings
 from app.schemas import (
@@ -204,7 +204,7 @@ def _call_gemini_rest(
             "temperature": 0.1,
         },
     }
-    res = requests.post(url, json=payload, timeout=45)
+    res = requests.post(url, json=payload, timeout=10)
     res.raise_for_status()
     return res.json()["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -244,6 +244,102 @@ def _build_predictions(yolo_result: YOLODetectionResult) -> list[DefectPredictio
     return predictions
 
 
+def _build_offline_assessment_response(
+    yolo_result: Optional[YOLODetectionResult],
+    assessment_id: str,
+    created_at: str,
+) -> CoffeeAssessmentResponse:
+    """Return a clearly qualified YOLO-and-rules assessment without Gemini."""
+    yolo_defect_counts = yolo_result.defect_counts if yolo_result else {}
+    primary_count = sum(
+        count for cls, count in yolo_defect_counts.items()
+        if YOLO_CATEGORY_MAP.get(cls) == "Primary Defect"
+    )
+    secondary_count = sum(
+        count for cls, count in yolo_defect_counts.items()
+        if YOLO_CATEGORY_MAP.get(cls) == "Secondary Defect"
+    )
+    total_defects = primary_count + secondary_count
+
+    # YOLO cannot estimate healthy beans. This is only the known defect count,
+    # and the limitation below makes that lower-bound explicit to consumers.
+    known_beans = total_defects
+    defect_pct = round((total_defects / known_beans * 100) if known_beans > 0 else 0.0, 2)
+    grading: GradingResult = calculate_grade(
+        total_beans=known_beans,
+        primary_defects_count=primary_count,
+        secondary_defects_count=secondary_count,
+        raw_counts=yolo_defect_counts,
+        category_map=YOLO_CATEGORY_MAP,
+    )
+
+    offline_notice = "Unavailable — Gemini analysis is offline."
+    offline_limitation = (
+        "Offline assessment: total and healthy bean counts could not be estimated. "
+        "The total shown is only the number of YOLO-detected defects. The defect "
+        "percentage describes that detected-defect subset only and must not be "
+        "interpreted as the defect rate of the full sample."
+    )
+    detected_classes = ", ".join(
+        f"{class_name}: {count}" for class_name, count in yolo_defect_counts.items()
+    ) or "No defects detected by YOLO."
+
+    return CoffeeAssessmentResponse(
+        assessment_id=assessment_id,
+        status="completed",
+        model_version="YOLOv8n-Coffee-ONNX-v1",
+        created_at=created_at or datetime.now(timezone.utc).isoformat(),
+        processing_time_ms=0,
+        summary=AssessmentSummary(
+            total_beans_detected=known_beans,
+            healthy_beans_count=0,
+            defect_beans_count=total_defects,
+            primary_defects_count=primary_count,
+            secondary_defects_count=secondary_count,
+            defect_percentage=defect_pct,
+            detected_classes=len(yolo_defect_counts),
+            detection_count=yolo_result.defect_beans if yolo_result else 0,
+        ),
+        predictions=_build_predictions(yolo_result) if yolo_result else [],
+        grade=GradeAssessment(
+            estimated_grade=grading.estimated_grade,
+            grade_class=grading.grade_class,
+            is_export_eligible=grading.is_export_eligible,
+            grade_basis=grading.grade_basis,
+            grade_confidence="partial",
+        ),
+        cupping_notes=CuppingNotes(
+            aroma=offline_notice,
+            flavor=offline_notice,
+            acidity=offline_notice,
+            body=offline_notice,
+            aftertaste=offline_notice,
+            estimated_sca_score=None,
+        ),
+        summary_text=BilingualSummary(
+            english=(
+                f"Offline assessment based on YOLO detections: {detected_classes}. "
+                "Gemini could not estimate the sample's total or healthy bean count "
+                "or provide cupping analysis. The defect percentage describes only "
+                "the detected-defect subset, not the full sample."
+            ),
+            amharic=(
+                "የጄሚኒ ትንተና አይገኝም። የYOLO የጉድለት ቆጠራ እና የECX "
+                "ግምታዊ ደረጃ ብቻ ተመልሰዋል።"
+            ),
+        ),
+        recommendations=grading.recommendations + [offline_notice],
+        limitations=STANDARD_LIMITATIONS + [offline_limitation],
+        coverage=DetectionCoverage(
+            classes_scanned=CLASSES_SCANNED,
+            classes_not_scanned=CLASSES_NOT_SCANNED,
+            coverage_note=grading.detection_note,
+        ),
+        yolo_detections=None,
+        annotated_image_url=None,
+    )
+
+
 def analyze_coffee_sample(
     image_bytes: bytes,
     yolo_result: Optional[YOLODetectionResult] = None,
@@ -271,26 +367,38 @@ def analyze_coffee_sample(
         6. Apply deterministic ECX grading_rules (overrides Gemini's grade guess)
         7. Assemble and return CoffeeAssessmentResponse
     """
-    # --- 1. Validate API key ---
-    if not settings.GEMINI_API_KEY:
-        raise ValueError(
-            "GEMINI_API_KEY is not configured. "
-            "Add it to your .env file (see .env.example for the required key name)."
-        )
-
-    # --- 2. Validate image ---
+    # --- 1. Validate image ---
     try:
-        pil_img = Image.open(io.BytesIO(image_bytes))
-        pil_img.verify()
-        pil_img = Image.open(io.BytesIO(image_bytes))  # re-open after verify() consumes stream
+        source_img = Image.open(io.BytesIO(image_bytes))
+        source_img.verify()
+        source_img = Image.open(io.BytesIO(image_bytes))  # re-open after verify() consumes stream
+        image_format = source_img.format or "JPEG"
+        orientation = source_img.getexif().get(274)
+        pil_img = ImageOps.exif_transpose(source_img)
+        pil_img.format = image_format
+        active_image_bytes = image_bytes
+        if orientation not in (None, 1):
+            image_buffer = io.BytesIO()
+            save_options = {"quality": 95} if image_format == "JPEG" else {}
+            pil_img.save(image_buffer, format=image_format, **save_options)
+            active_image_bytes = image_buffer.getvalue()
+            pil_img = Image.open(io.BytesIO(active_image_bytes))
     except Exception as e:
         raise ValueError(f"Cannot decode image: {str(e)}")
 
+    # --- 2. Fall back to local grading when Gemini is not configured ---
+    if not settings.GEMINI_API_KEY:
+        logger.warning(f"[{assessment_id}] Gemini API key is not configured; returning offline assessment")
+        return _build_offline_assessment_response(yolo_result, assessment_id, created_at)
+
     # --- 3. Prefer annotated image (boxes already drawn by YOLO) ---
-    active_image_bytes = image_bytes
     if yolo_result and yolo_result.annotated_image_base64:
         try:
-            active_image_bytes = base64.b64decode(yolo_result.annotated_image_base64)
+            annotated_image_bytes = base64.b64decode(yolo_result.annotated_image_base64)
+            annotated_pil_img = Image.open(io.BytesIO(annotated_image_bytes))
+            annotated_pil_img.load()
+            active_image_bytes = annotated_image_bytes
+            pil_img = annotated_pil_img
             logger.info(f"[{assessment_id}] Using YOLO-annotated image for Gemini input")
         except Exception as e:
             logger.warning(f"[{assessment_id}] Could not decode annotated image: {e} — using original")
@@ -314,8 +422,6 @@ def analyze_coffee_sample(
         raw_text = _call_gemini_sdk(client, pil_img, active_image_bytes, prompt_text)
         logger.info(f"[{assessment_id}] Gemini SDK call succeeded")
     except Exception as sdk_err:
-        if "API_KEY_INVALID" in str(sdk_err) or "PERMISSION_DENIED" in str(sdk_err):
-            raise ValueError(f"Gemini API key error: {sdk_err}")
         logger.warning(
             f"[{assessment_id}] Gemini SDK failed ({sdk_err}), trying REST fallback"
         )
@@ -323,20 +429,50 @@ def analyze_coffee_sample(
             raw_text = _call_gemini_rest(active_image_bytes, prompt_text)
             logger.info(f"[{assessment_id}] Gemini REST fallback succeeded")
         except Exception as rest_err:
-            raise RuntimeError(
-                f"Gemini API unavailable. SDK error: {sdk_err}. REST error: {rest_err}"
+            logger.error(
+                f"[{assessment_id}] Gemini unavailable through SDK and REST "
+                f"(SDK error: {sdk_err}; REST error: {rest_err}); returning offline assessment"
             )
+            return _build_offline_assessment_response(yolo_result, assessment_id, created_at)
 
     # --- 6. Parse Gemini JSON ---
     try:
         gemini_data = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        logger.error(f"[{assessment_id}] Gemini returned non-JSON: {raw_text[:500]}")
-        raise RuntimeError(f"Gemini returned invalid JSON: {e}")
+        if not isinstance(gemini_data, dict):
+            raise TypeError("Gemini response JSON must be an object")
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.warning(f"[{assessment_id}] Gemini returned invalid JSON ({e}); returning offline assessment")
+        return _build_offline_assessment_response(yolo_result, assessment_id, created_at)
 
     # --- 7. Extract Gemini estimates ---
-    total_beans = int(gemini_data.get("total_beans_estimated", 0))
-    healthy_beans = int(gemini_data.get("healthy_beans_estimated", 0))
+    try:
+        total_beans = int(gemini_data.get("total_beans_estimated", 0))
+        healthy_beans = int(gemini_data.get("healthy_beans_estimated", 0))
+        if total_beans < 0 or healthy_beans < 0:
+            raise ValueError("Gemini bean estimates cannot be negative")
+        cn_raw = gemini_data.get("cupping_notes", {})
+        if not isinstance(cn_raw, dict):
+            raise TypeError("Gemini cupping_notes must be an object")
+        cupping_notes = CuppingNotes(
+            aroma=cn_raw.get("aroma"),
+            flavor=cn_raw.get("flavor"),
+            acidity=cn_raw.get("acidity"),
+            body=cn_raw.get("body"),
+            aftertaste=cn_raw.get("aftertaste"),
+            estimated_sca_score=cn_raw.get("estimated_sca_score"),
+        )
+        quality_summary_en = gemini_data.get("quality_summary_en", "")
+        quality_summary_am = gemini_data.get("quality_summary_am", "")
+        gemini_recommendations = gemini_data.get("recommendations", [])
+        if not isinstance(quality_summary_en, str) or not isinstance(quality_summary_am, str):
+            raise TypeError("Gemini quality summaries must be strings")
+        if not isinstance(gemini_recommendations, list) or not all(
+            isinstance(item, str) for item in gemini_recommendations
+        ):
+            raise TypeError("Gemini recommendations must be a list of strings")
+    except (TypeError, ValueError, OverflowError) as e:
+        logger.warning(f"[{assessment_id}] Gemini response has invalid fields ({e}); returning offline assessment")
+        return _build_offline_assessment_response(yolo_result, assessment_id, created_at)
 
     # Defect counts come from YOLO (ground truth), not Gemini
     yolo_defect_counts = yolo_result.defect_counts if yolo_result else {}
@@ -349,7 +485,10 @@ def analyze_coffee_sample(
         if YOLO_CATEGORY_MAP.get(cls) == "Secondary Defect"
     )
     total_defects = primary_count + secondary_count
+    total_beans = max(total_beans, total_defects)
+    healthy_beans = min(healthy_beans, total_beans - total_defects)
     defect_pct = round((total_defects / total_beans * 100) if total_beans > 0 else 0.0, 2)
+    defect_pct = min(100.0, defect_pct)
 
     # --- 8. Run deterministic ECX grading engine ---
     grading: GradingResult = calculate_grade(
@@ -358,17 +497,6 @@ def analyze_coffee_sample(
         secondary_defects_count=secondary_count,
         raw_counts=yolo_defect_counts,
         category_map=YOLO_CATEGORY_MAP,
-    )
-
-    # --- 9. Build cupping notes from Gemini output ---
-    cn_raw = gemini_data.get("cupping_notes", {})
-    cupping_notes = CuppingNotes(
-        aroma=cn_raw.get("aroma"),
-        flavor=cn_raw.get("flavor"),
-        acidity=cn_raw.get("acidity"),
-        body=cn_raw.get("body"),
-        aftertaste=cn_raw.get("aftertaste"),
-        estimated_sca_score=cn_raw.get("estimated_sca_score"),
     )
 
     # --- 10. Build predictions array from YOLO counts ---
@@ -406,11 +534,11 @@ def analyze_coffee_sample(
         cupping_notes=cupping_notes,
 
         summary_text=BilingualSummary(
-            english=gemini_data.get("quality_summary_en", ""),
-            amharic=gemini_data.get("quality_summary_am", ""),
+            english=quality_summary_en,
+            amharic=quality_summary_am,
         ),
 
-        recommendations=grading.recommendations + gemini_data.get("recommendations", []),
+        recommendations=grading.recommendations + gemini_recommendations,
 
         limitations=STANDARD_LIMITATIONS,
 

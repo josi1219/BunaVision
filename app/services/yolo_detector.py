@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from app.schemas import (
     BoundingBox,
@@ -167,7 +167,9 @@ class YOLODetectorService:
         return "Secondary Defect"
 
     def detect(self, image_bytes: bytes, confidence_threshold: float = 0.25) -> YOLODetectionResult:
-        pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        pil_img = ImageOps.exif_transpose(
+            Image.open(io.BytesIO(image_bytes))
+        ).convert("RGB")
 
         if self.is_loaded and self.engine_type == "onnx":
             return self._predict_onnx(pil_img, confidence_threshold)
@@ -291,8 +293,74 @@ class YOLODetectorService:
     def _predict_torch(self, pil_img: Image.Image, conf: float) -> YOLODetectionResult:
         """Fallback to PyTorch if ultralytics is available."""
         results = self.session.predict(pil_img, conf=conf, imgsz=640, verbose=False)[0]
-        # (Torch branch implementation)
-        return self._fallback_demo(pil_img)
+        boxes = results.boxes
+        if boxes is None or len(boxes) == 0:
+            return YOLODetectionResult(
+                model_version="YOLOv8n-Coffee-ONNX-v1",
+                total_beans=0,
+                healthy_beans=-1,
+                defect_beans=0,
+                defect_counts={},
+                detected_beans=[],
+                annotated_image_base64=None
+            )
+
+        model_names = getattr(results, "names", {}) or {}
+        detected_beans: List[DetectedBean] = []
+        counts: Dict[str, int] = {}
+        annotated_img = pil_img.copy()
+        draw = ImageDraw.Draw(annotated_img)
+
+        for box in boxes:
+            coords = [float(value) for value in box.xyxy[0].tolist()]
+            conf_score = float(box.conf[0])
+            cls_id = int(box.cls[0])
+
+            if isinstance(model_names, dict):
+                raw_name = model_names.get(
+                    cls_id,
+                    model_names.get(str(cls_id), ONNX_CLASSES.get(cls_id, f"defect_{cls_id}"))
+                )
+            elif 0 <= cls_id < len(model_names):
+                raw_name = model_names[cls_id]
+            else:
+                raw_name = ONNX_CLASSES.get(cls_id, f"defect_{cls_id}")
+
+            raw_name = str(raw_name)
+            display_name = CLASS_NAME_MAP.get(
+                raw_name.lower(),
+                raw_name.replace("-", " ").title()
+            )
+            category = self.classify_category(raw_name)
+            counts[display_name] = counts.get(display_name, 0) + 1
+
+            detected_beans.append(
+                DetectedBean(
+                    box=BoundingBox(x1=coords[0], y1=coords[1], x2=coords[2], y2=coords[3]),
+                    class_name=display_name,
+                    confidence=round(conf_score, 3),
+                    category=category
+                )
+            )
+
+            color = CLASS_COLORS.get(category, (220, 38, 38))
+            draw.rectangle(coords, outline=color, width=3)
+            tag = f"{display_name} {conf_score:.0%}"
+            draw.text((coords[0] + 4, max(0, coords[1] - 12)), tag, fill=color)
+
+        buf = io.BytesIO()
+        annotated_img.save(buf, format="JPEG", quality=90)
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        return YOLODetectionResult(
+            model_version="YOLOv8n-Coffee-ONNX-v1",
+            total_beans=len(detected_beans),
+            healthy_beans=-1,
+            defect_beans=len(detected_beans),
+            defect_counts=counts,
+            detected_beans=detected_beans,
+            annotated_image_base64=img_b64
+        )
 
     def _fallback_demo(self, pil_img: Image.Image) -> YOLODetectionResult:
         return YOLODetectionResult(
